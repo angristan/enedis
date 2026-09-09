@@ -21,7 +21,7 @@
   "dependencies": {
     "effect": "4.0.0-beta.97",
     "lucide-react": "1.21.0",
-    "maplibre-gl": "5.24.0",
+    "maplibre-gl": "6.4.1",
     "react": "19.2.7",
     "react-dom": "19.2.7",
     "react-map-gl": "8.1.1"
