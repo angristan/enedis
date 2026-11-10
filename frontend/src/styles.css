@@ -613,6 +613,16 @@ button {
   text-align: right;
 }
 
+.warnings-notice {
+  margin: 0;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: #fff4e5;
+  color: #8a4b00;
+  font-size: 12px;
+  font-weight: 600;
+}
+
 .legend-dot {
   width: 8px;
   height: 8px;

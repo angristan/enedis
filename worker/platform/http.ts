@@ -1,4 +1,4 @@
-import { Context, Effect, Layer, Schema } from "effect";
+import { Context, Effect, Layer, Schedule, Schema } from "effect";
 import {
   UpstreamDecodeError,
   type UpstreamError,
@@ -48,42 +48,36 @@ export function upstreamCoordinatorLayer(env: WorkerEnv) {
         }
 
         const stub = namespace.get(namespace.idFromName(request.provider));
-        return Effect.tryPromise({
-          try: () =>
-            tracedPromise(
-              requestContext.trace,
-              "upstream.request",
-              {
-                ...attributes,
-                "upstream.provider": request.provider,
-                "upstream.operation": request.operation,
-              },
-              async (span) => {
-                let attempt = 0;
-                while (true) {
-                  attempt += 1;
-                  span.setAttribute("upstream.attempt", attempt);
-                  try {
-                    return await fetchCoordinatorOnce(stub, request);
-                  } catch (cause) {
-                    if (
-                      attempt >= COORDINATOR_MAX_ATTEMPTS ||
-                      !isRetryableCoordinatorFailure(request, cause)
-                    ) {
-                      throw cause;
-                    }
-                    await sleep(COORDINATOR_RETRY_DELAY_MS);
-                  }
-                }
-              },
-            ),
-          catch: (cause) =>
-            UpstreamTransportError.make({
-              provider: request.provider,
-              operation: request.operation,
-              cause,
-            }),
-        }).pipe(
+        let attempt = 0;
+        const attemptOnce = Effect.suspend(() => {
+          attempt += 1;
+          return Effect.tryPromise({
+            try: () =>
+              tracedPromise(
+                requestContext.trace,
+                "upstream.request",
+                {
+                  ...attributes,
+                  "upstream.provider": request.provider,
+                  "upstream.operation": request.operation,
+                  "upstream.attempt": attempt,
+                },
+                () => fetchCoordinatorOnce(stub, request),
+              ),
+            catch: (cause) =>
+              UpstreamTransportError.make({
+                provider: request.provider,
+                operation: request.operation,
+                cause,
+              }),
+          });
+        });
+
+        return attemptOnce.pipe(
+          Effect.retry({
+            schedule: COORDINATOR_RETRY_SCHEDULE,
+            while: (error) => isRetryableCoordinatorFailure(request, error),
+          }),
           Effect.flatMap((payload) =>
             Schema.decodeUnknownEffect(CoordinatedResultSchema)(payload).pipe(
               Effect.mapError((cause) =>
@@ -100,8 +94,9 @@ export function upstreamCoordinatorLayer(env: WorkerEnv) {
   }));
 }
 
-const COORDINATOR_MAX_ATTEMPTS = 2;
-const COORDINATOR_RETRY_DELAY_MS = 250;
+const COORDINATOR_RETRY_SCHEDULE = Schedule.jittered(
+  Schedule.addDelay(Schedule.recurs(1), () => Effect.succeed("250 millis")),
+);
 const COORDINATOR_RETRYABLE_STATUSES: ReadonlySet<number> = new Set([
   500, 502, 503, 504,
 ]);
@@ -131,22 +126,23 @@ async function fetchCoordinatorOnce(
 
 function isRetryableCoordinatorFailure(
   request: CoordinatedRequest,
-  cause: unknown,
+  error: UpstreamTransportError,
 ): boolean {
   if (request.method !== "GET" && request.method !== "HEAD") return false;
+  const cause: unknown = error.cause;
   if (
-    cause instanceof Error &&
-    typeof (cause as CoordinatorHttpError).status === "number"
+    typeof cause === "object" && cause !== null &&
+    (cause as { readonly overloaded?: unknown }).overloaded === true
   ) {
-    return COORDINATOR_RETRYABLE_STATUSES.has(
-      (cause as CoordinatorHttpError).status,
-    );
+    return false;
+  }
+  if (cause instanceof Error) {
+    const status = (cause as CoordinatorHttpError).status;
+    if (typeof status === "number") {
+      return COORDINATOR_RETRYABLE_STATUSES.has(status);
+    }
   }
   return true;
-}
-
-function sleep(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 export class RawHttp extends Context.Service<RawHttp, {

@@ -52,7 +52,7 @@ function coordinatorLayer(env: WorkerEnv) {
 }
 
 describe("upstream coordinator client", () => {
-  it.effect("retries once when the coordinator returns a transient 500", () => {
+  it.live("retries once when the coordinator returns a transient 500", () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(
         new Response("coordinator execution failed", { status: 500 }),
@@ -67,7 +67,7 @@ describe("upstream coordinator client", () => {
     }).pipe(Effect.provide(coordinatorLayer(makeEnv(fetchMock))));
   });
 
-  it.effect("retries a dropped coordinator connection once", () => {
+  it.live("retries a dropped coordinator connection once", () => {
     const fetchMock = vi.fn()
       .mockRejectedValueOnce(new Error("Durable Object unavailable"))
       .mockResolvedValueOnce(jsonResponse(okResult));
@@ -107,7 +107,24 @@ describe("upstream coordinator client", () => {
     }).pipe(Effect.provide(coordinatorLayer(makeEnv(fetchMock))));
   });
 
-  it.effect("gives up after the second attempt on persistent 500s", () => {
+  it.effect("does not retry when the Durable Object reports overload", () => {
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(
+        Object.assign(new Error("Durable Object overloaded"), {
+          overloaded: true,
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse(okResult));
+
+    return Effect.gen(function* () {
+      const client = yield* UpstreamCoordinatorClient;
+      const error = yield* Effect.flip(client.request(request));
+      assert.strictEqual(error._tag, "UpstreamTransportError");
+      assert.strictEqual(fetchMock.mock.calls.length, 1);
+    }).pipe(Effect.provide(coordinatorLayer(makeEnv(fetchMock))));
+  });
+
+  it.live("gives up after the second attempt on persistent 500s", () => {
     const fetchMock = vi.fn()
       .mockResolvedValue(new Response("coordinator execution failed", { status: 500 }));
 
