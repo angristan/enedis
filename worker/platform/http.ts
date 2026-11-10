@@ -115,8 +115,14 @@ async function fetchCoordinatorOnce(
     body: JSON.stringify(request),
   });
   if (!response.ok) {
+    let detail = "";
+    try {
+      detail = `: ${await response.text()}`.slice(0, 200);
+    } catch {
+      // The status alone remains authoritative when the body is unreadable.
+    }
     const error = new Error(
-      `coordinator returned ${response.status}`,
+      `coordinator returned ${response.status}${detail}`,
     ) as CoordinatorHttpError;
     error.status = response.status;
     throw error;

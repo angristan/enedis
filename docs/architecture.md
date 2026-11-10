@@ -53,8 +53,10 @@ only component that calls external providers. It schedules requests through a bo
 persisted token bucket and concurrency cap, coalesces identical in-flight work, and briefly reuses successful
 responses in a size- and entry-bounded memory cache. Provider origin and method allowlists, queue deadlines,
 fetch deadlines, and body limits fail closed. Coordinator failure never falls back to an unbudgeted direct request. Idempotent (GET/HEAD) requests are
-retried once after a short delay when the coordinator call itself fails transiently (connection error or HTTP 500/502/503/504
-from the Durable Object); the attempt count is recorded as the `upstream.attempt` trace attribute.
+retried once after a random delay of up to ~250 ms when the coordinator call itself fails transiently (a connection
+error, or an HTTP 500/502/503/504 response from the Durable Object); failures flagged `.overloaded` are never
+retried. Each attempt is traced with an `upstream.attempt` attribute, the failed response body is included in the
+error message, and the coordinator logs the exception behind its own HTTP 500 responses.
 `RawHttp` classifies the returned status, parses JSON as `unknown`, and Schema-decodes it.
 
 ## Viewport request flow

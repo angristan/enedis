@@ -86,6 +86,7 @@ interface PermitWaiter {
   readonly policy: ProviderPolicy;
   readonly expiresAt: number;
   readonly resolve: (result: Permit | CoordinatedFailure) => void;
+  readonly reject: (error: unknown) => void;
 }
 
 interface ProviderQueue {
@@ -269,11 +270,12 @@ class PermitScheduler {
       return Promise.resolve(concurrencyFailure("upstream request queue is full"));
     }
 
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       queue.waiting.push({
         policy,
         expiresAt: this.options.now() + this.options.maximumWaitMs,
         resolve,
+        reject,
       });
       this.pump(provider, queue);
     });
@@ -304,12 +306,7 @@ class PermitScheduler {
         budget = this.takeToken(provider, waiter.policy, now);
       } catch (error) {
         queue.waiting.shift();
-        console.error("coordinator token bucket read failed", error);
-        waiter.resolve(
-          transportFailure(
-            error instanceof Error ? error.message : "token bucket read failed",
-          ),
-        );
+        waiter.reject(error);
         continue;
       }
 
@@ -664,15 +661,6 @@ function budgetFailure(retryAfter: number): CoordinatedFailure {
     reason: "budget",
     retryAfter,
     message: "upstream request budget exhausted",
-  };
-}
-
-function transportFailure(message: string): CoordinatedFailure {
-  return {
-    ok: false,
-    reason: "transport",
-    retryAfter: 1,
-    message,
   };
 }
 

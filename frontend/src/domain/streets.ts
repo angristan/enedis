@@ -86,11 +86,8 @@ export function buildStatusText(payload: OutageResponse): string {
 export function warningsNotice(
   warnings: ReadonlyArray<string> | undefined,
 ): string | null {
-  const count = warnings?.length ?? 0;
-  if (count === 0) return null;
-  return `Données partielles : ${
-    formatNumber(count)
-  } alerte${count === 1 ? "" : "s"} — certaines communes n'ont pas pu être actualisées.`;
+  if ((warnings?.length ?? 0) === 0) return null;
+  return "Données partielles : certaines communes n'ont pas pu être actualisées.";
 }
 
 export function formatNumber(value: number | undefined): string {

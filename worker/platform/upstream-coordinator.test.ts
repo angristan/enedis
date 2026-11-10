@@ -194,16 +194,6 @@ describe("permit scheduler", () => {
     if ("release" in third) third.release();
   });
 
-  it("resolves a transport failure instead of rejecting when the token read throws", async () => {
-    const scheduler = new testExports.PermitScheduler(() => {
-      throw new Error("SQLITE_BUSY");
-    });
-
-    const permit = await scheduler.acquire("Enedis", testExports.POLICIES.Enedis);
-    assert.isFalse(permit.ok);
-    if (!permit.ok) assert.strictEqual(permit.reason, "transport");
-  });
-
   it("caps the queue and expires a concurrency wait", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
