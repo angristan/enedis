@@ -556,7 +556,8 @@ async function handleCoordinatorFetch(
 
   try {
     return Response.json(await execute(input));
-  } catch {
+  } catch (error) {
+    console.error("coordinator execution failed", error);
     return Response.json(
       { error: "coordinator execution failed" },
       { status: 500 },

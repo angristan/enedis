@@ -22,6 +22,7 @@ import {
   type StreetFilter,
   streetRestoreText,
   streetSummaryText,
+  warningsNotice,
 } from "../domain/streets.js";
 import { hasMapLayer } from "../map/geometry.js";
 import {
@@ -78,6 +79,7 @@ export const SidePanel = forwardRef<HTMLDivElement, SidePanelProps>(
     );
     const [mobileDragging, setMobileDragging] = useState(false);
     const allStreets = data?.streets ?? [];
+    const notice = warningsNotice(data?.warnings);
     const filterCounts: Record<StreetFilter, number> = {
       all: allStreets.length,
       "Incident HTA": allStreets.filter((street) =>
@@ -258,6 +260,9 @@ export const SidePanel = forwardRef<HTMLDivElement, SidePanelProps>(
               ? "Actualisation en attente"
               : `Actualisé à ${formatTime(data.updatedAt)}`}</span>
           </div>
+          {notice === null ? null : (
+            <p className="warnings-notice" role="status">{notice}</p>
+          )}
           <StreetList
             ref={ref}
             activeKey={activeKey}
