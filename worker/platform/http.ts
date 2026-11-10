@@ -101,8 +101,13 @@ const COORDINATOR_RETRYABLE_STATUSES: ReadonlySet<number> = new Set([
   500, 502, 503, 504,
 ]);
 
-interface CoordinatorHttpError extends Error {
-  status: number;
+class CoordinatorHttpError extends Error {
+  readonly status: number;
+
+  constructor(status: number, detail: string) {
+    super(`coordinator returned ${status}${detail}`);
+    this.status = status;
+  }
 }
 
 async function fetchCoordinatorOnce(
@@ -121,11 +126,7 @@ async function fetchCoordinatorOnce(
     } catch {
       // The status alone remains authoritative when the body is unreadable.
     }
-    const error = new Error(
-      `coordinator returned ${response.status}${detail}`,
-    ) as CoordinatorHttpError;
-    error.status = response.status;
-    throw error;
+    throw new CoordinatorHttpError(response.status, detail);
   }
   return response.json();
 }
@@ -136,17 +137,14 @@ function isRetryableCoordinatorFailure(
 ): boolean {
   if (request.method !== "GET" && request.method !== "HEAD") return false;
   const cause: unknown = error.cause;
+  if (cause instanceof CoordinatorHttpError) {
+    return COORDINATOR_RETRYABLE_STATUSES.has(cause.status);
+  }
   if (
     typeof cause === "object" && cause !== null &&
     (cause as { readonly overloaded?: unknown }).overloaded === true
   ) {
     return false;
-  }
-  if (cause instanceof Error) {
-    const status = (cause as CoordinatorHttpError).status;
-    if (typeof status === "number") {
-      return COORDINATOR_RETRYABLE_STATUSES.has(status);
-    }
   }
   return true;
 }

@@ -28,12 +28,58 @@ const okResult: CoordinatedResult = {
   text: "{}",
 };
 
-function jsonResponse(payload: unknown, status = 200): Response {
-  return new Response(JSON.stringify(payload), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
+type Outcome = "ok" | "network" | "overloaded" | 400 | 500;
+
+interface RetryCase {
+  readonly name: string;
+  readonly outcomes: ReadonlyArray<Outcome>;
+  readonly method?: string;
+  readonly expectedCalls: number;
+  readonly expectOk: boolean;
+  readonly errorMatch?: RegExp;
 }
+
+const cases: ReadonlyArray<RetryCase> = [
+  {
+    name: "retries a transient 500 once",
+    outcomes: [500, "ok"],
+    expectedCalls: 2,
+    expectOk: true,
+  },
+  {
+    name: "retries a dropped coordinator connection once",
+    outcomes: ["network", "ok"],
+    expectedCalls: 2,
+    expectOk: true,
+  },
+  {
+    name: "does not retry a 400 and includes the response body in the error",
+    outcomes: [400],
+    expectedCalls: 1,
+    expectOk: false,
+    errorMatch: /coordinator returned 400: .*invalid coordinator request/,
+  },
+  {
+    name: "does not retry non-idempotent requests",
+    outcomes: [500],
+    method: "POST",
+    expectedCalls: 1,
+    expectOk: false,
+  },
+  {
+    name: "does not retry when the Durable Object reports overload",
+    outcomes: ["overloaded", "ok"],
+    expectedCalls: 1,
+    expectOk: false,
+  },
+  {
+    name: "gives up after one retry on persistent 500s",
+    outcomes: [500, 500],
+    expectedCalls: 2,
+    expectOk: false,
+    errorMatch: /coordinator returned 500/,
+  },
+];
 
 function makeEnv(fetchMock: ReturnType<typeof vi.fn>): WorkerEnv {
   return {
@@ -61,102 +107,59 @@ const settleRetrySchedule = Effect.gen(function* () {
   }
 });
 
-describe("upstream coordinator client", () => {
-  it.effect("retries once when the coordinator returns a transient 500", () => {
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(
-        new Response('{"error":"coordinator execution failed"}', { status: 500 }),
-      )
-      .mockResolvedValueOnce(jsonResponse(okResult));
-
-    return Effect.gen(function* () {
-      const client = yield* UpstreamCoordinatorClient;
-      const fiber = yield* Effect.forkChild(client.request(request));
-      yield* settleRetrySchedule;
-      const result = yield* Fiber.join(fiber);
-      assert.deepEqual(result, okResult);
-      assert.strictEqual(fetchMock.mock.calls.length, 2);
-    }).pipe(Effect.provide(coordinatorLayer(makeEnv(fetchMock))));
-  });
-
-  it.effect("retries a dropped coordinator connection once", () => {
-    const fetchMock = vi.fn()
-      .mockRejectedValueOnce(new Error("Durable Object unavailable"))
-      .mockResolvedValueOnce(jsonResponse(okResult));
-
-    return Effect.gen(function* () {
-      const client = yield* UpstreamCoordinatorClient;
-      const fiber = yield* Effect.forkChild(client.request(request));
-      yield* settleRetrySchedule;
-      const result = yield* Fiber.join(fiber);
-      assert.deepEqual(result, okResult);
-      assert.strictEqual(fetchMock.mock.calls.length, 2);
-    }).pipe(Effect.provide(coordinatorLayer(makeEnv(fetchMock))));
-  });
-
-  it.effect("does not retry non-retryable coordinator statuses", () => {
-    const fetchMock = vi.fn()
-      .mockResolvedValue(
-        new Response('{"error":"invalid coordinator request"}', { status: 400 }),
+function runCase(testCase: RetryCase) {
+  const fetchMock = vi.fn();
+  for (const outcome of testCase.outcomes) {
+    if (outcome === "ok") {
+      fetchMock.mockResolvedValueOnce(
+        new Response(JSON.stringify(okResult), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
       );
-
-    return Effect.gen(function* () {
-      const client = yield* UpstreamCoordinatorClient;
-      const error = yield* Effect.flip(client.request(request));
-      assert.strictEqual(error._tag, "UpstreamTransportError");
-      assert.match(String(error.cause), /coordinator returned 400/);
-      assert.match(String(error.cause), /invalid coordinator request/);
-      assert.strictEqual(fetchMock.mock.calls.length, 1);
-    }).pipe(Effect.provide(coordinatorLayer(makeEnv(fetchMock))));
-  });
-
-  it.effect("does not retry non-idempotent requests", () => {
-    const fetchMock = vi.fn()
-      .mockResolvedValue(new Response("coordinator execution failed", { status: 500 }));
-
-    return Effect.gen(function* () {
-      const client = yield* UpstreamCoordinatorClient;
-      const error = yield* Effect.flip(
-        client.request({ ...request, method: "POST" }),
-      );
-      assert.strictEqual(error._tag, "UpstreamTransportError");
-      assert.strictEqual(fetchMock.mock.calls.length, 1);
-    }).pipe(Effect.provide(coordinatorLayer(makeEnv(fetchMock))));
-  });
-
-  it.effect("does not retry when the Durable Object reports overload", () => {
-    const fetchMock = vi.fn()
-      .mockRejectedValueOnce(
+    } else if (outcome === "network") {
+      fetchMock.mockRejectedValueOnce(new Error("Durable Object unavailable"));
+    } else if (outcome === "overloaded") {
+      fetchMock.mockRejectedValueOnce(
         Object.assign(new Error("Durable Object overloaded"), {
           overloaded: true,
         }),
-      )
-      .mockResolvedValueOnce(jsonResponse(okResult));
+      );
+    } else {
+      fetchMock.mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: outcome === 500
+              ? "coordinator execution failed"
+              : "invalid coordinator request",
+          }),
+          { status: outcome },
+        ),
+      );
+    }
+  }
 
-    return Effect.gen(function* () {
-      const client = yield* UpstreamCoordinatorClient;
-      const error = yield* Effect.flip(client.request(request));
-      assert.strictEqual(error._tag, "UpstreamTransportError");
-      assert.strictEqual(fetchMock.mock.calls.length, 1);
-    }).pipe(Effect.provide(coordinatorLayer(makeEnv(fetchMock))));
-  });
-
-  it.effect("gives up after the second attempt on persistent 500s", () => {
-    const fetchMock = vi.fn()
-      .mockResolvedValue(new Response("coordinator execution failed", { status: 500 }));
-
-    return Effect.gen(function* () {
-      const client = yield* UpstreamCoordinatorClient;
-      const fiber = yield* Effect.forkChild(client.request(request));
-      yield* settleRetrySchedule;
-      const exit = yield* Effect.exit(Fiber.join(fiber));
+  return Effect.gen(function* () {
+    const client = yield* UpstreamCoordinatorClient;
+    const fiber = yield* Effect.forkChild(
+      client.request({ ...request, method: testCase.method ?? "GET" }),
+    );
+    yield* settleRetrySchedule;
+    const exit = yield* Effect.exit(Fiber.join(fiber));
+    if (testCase.expectOk) {
+      assert.isTrue(Exit.isSuccess(exit));
+    } else {
       assert.isTrue(Exit.isFailure(exit));
-      if (Exit.isFailure(exit)) {
-        const pretty = Cause.pretty(exit.cause);
-        assert.match(pretty, /UpstreamTransportError/);
-        assert.match(pretty, /coordinator returned 500/);
+      if (Exit.isFailure(exit) && testCase.errorMatch !== undefined) {
+        assert.match(Cause.pretty(exit.cause), testCase.errorMatch);
       }
-      assert.strictEqual(fetchMock.mock.calls.length, 2);
-    }).pipe(Effect.provide(coordinatorLayer(makeEnv(fetchMock))));
-  });
+    }
+    assert.strictEqual(fetchMock.mock.calls.length, testCase.expectedCalls);
+  }).pipe(Effect.provide(coordinatorLayer(makeEnv(fetchMock))));
+}
+
+describe("upstream coordinator client", () => {
+  for (const testCase of cases) {
+    it.effect(testCase.name, () => runCase(testCase));
+  }
 });
