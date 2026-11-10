@@ -58,19 +58,23 @@ export function upstreamCoordinatorLayer(env: WorkerEnv) {
                 "upstream.provider": request.provider,
                 "upstream.operation": request.operation,
               },
-              async () => {
-                const response = await stub.fetch(
-                  "https://coordinator.internal/request",
-                  {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(request),
-                  },
-                );
-                if (!response.ok) {
-                  throw new Error(`coordinator returned ${response.status}`);
+              async (span) => {
+                let attempt = 0;
+                while (true) {
+                  attempt += 1;
+                  span.setAttribute("upstream.attempt", attempt);
+                  try {
+                    return await fetchCoordinatorOnce(stub, request);
+                  } catch (cause) {
+                    if (
+                      attempt >= COORDINATOR_MAX_ATTEMPTS ||
+                      !isRetryableCoordinatorFailure(request, cause)
+                    ) {
+                      throw cause;
+                    }
+                    await sleep(COORDINATOR_RETRY_DELAY_MS);
+                  }
                 }
-                return response.json();
               },
             ),
           catch: (cause) =>
@@ -94,6 +98,55 @@ export function upstreamCoordinatorLayer(env: WorkerEnv) {
       },
     };
   }));
+}
+
+const COORDINATOR_MAX_ATTEMPTS = 2;
+const COORDINATOR_RETRY_DELAY_MS = 250;
+const COORDINATOR_RETRYABLE_STATUSES: ReadonlySet<number> = new Set([
+  500, 502, 503, 504,
+]);
+
+interface CoordinatorHttpError extends Error {
+  status: number;
+}
+
+async function fetchCoordinatorOnce(
+  stub: DurableObjectStub,
+  request: CoordinatedRequest,
+): Promise<unknown> {
+  const response = await stub.fetch("https://coordinator.internal/request", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  });
+  if (!response.ok) {
+    const error = new Error(
+      `coordinator returned ${response.status}`,
+    ) as CoordinatorHttpError;
+    error.status = response.status;
+    throw error;
+  }
+  return response.json();
+}
+
+function isRetryableCoordinatorFailure(
+  request: CoordinatedRequest,
+  cause: unknown,
+): boolean {
+  if (request.method !== "GET" && request.method !== "HEAD") return false;
+  if (
+    cause instanceof Error &&
+    typeof (cause as CoordinatorHttpError).status === "number"
+  ) {
+    return COORDINATOR_RETRYABLE_STATUSES.has(
+      (cause as CoordinatorHttpError).status,
+    );
+  }
+  return true;
+}
+
+function sleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 export class RawHttp extends Context.Service<RawHttp, {
