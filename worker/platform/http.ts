@@ -1,4 +1,4 @@
-import { Context, Effect, Layer, Schema } from "effect";
+import { Context, Effect, Layer, Schedule, Schema } from "effect";
 import {
   UpstreamDecodeError,
   type UpstreamError,
@@ -48,38 +48,36 @@ export function upstreamCoordinatorLayer(env: WorkerEnv) {
         }
 
         const stub = namespace.get(namespace.idFromName(request.provider));
-        return Effect.tryPromise({
-          try: () =>
-            tracedPromise(
-              requestContext.trace,
-              "upstream.request",
-              {
-                ...attributes,
-                "upstream.provider": request.provider,
-                "upstream.operation": request.operation,
-              },
-              async () => {
-                const response = await stub.fetch(
-                  "https://coordinator.internal/request",
-                  {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(request),
-                  },
-                );
-                if (!response.ok) {
-                  throw new Error(`coordinator returned ${response.status}`);
-                }
-                return response.json();
-              },
-            ),
-          catch: (cause) =>
-            UpstreamTransportError.make({
-              provider: request.provider,
-              operation: request.operation,
-              cause,
-            }),
-        }).pipe(
+        let attempt = 0;
+        const attemptOnce = Effect.suspend(() => {
+          attempt += 1;
+          return Effect.tryPromise({
+            try: () =>
+              tracedPromise(
+                requestContext.trace,
+                "upstream.request",
+                {
+                  ...attributes,
+                  "upstream.provider": request.provider,
+                  "upstream.operation": request.operation,
+                  "upstream.attempt": attempt,
+                },
+                () => fetchCoordinatorOnce(stub, request),
+              ),
+            catch: (cause) =>
+              UpstreamTransportError.make({
+                provider: request.provider,
+                operation: request.operation,
+                cause,
+              }),
+          });
+        });
+
+        return attemptOnce.pipe(
+          Effect.retry({
+            schedule: COORDINATOR_RETRY_SCHEDULE,
+            while: (error) => isRetryableCoordinatorFailure(request, error),
+          }),
           Effect.flatMap((payload) =>
             Schema.decodeUnknownEffect(CoordinatedResultSchema)(payload).pipe(
               Effect.mapError((cause) =>
@@ -94,6 +92,61 @@ export function upstreamCoordinatorLayer(env: WorkerEnv) {
       },
     };
   }));
+}
+
+const COORDINATOR_RETRY_SCHEDULE = Schedule.jittered(
+  Schedule.addDelay(Schedule.recurs(1), () => Effect.succeed("250 millis")),
+);
+const COORDINATOR_RETRYABLE_STATUSES: ReadonlySet<number> = new Set([
+  500, 502, 503, 504,
+]);
+
+class CoordinatorHttpError extends Error {
+  readonly status: number;
+
+  constructor(status: number, detail: string) {
+    super(`coordinator returned ${status}${detail}`);
+    this.status = status;
+  }
+}
+
+async function fetchCoordinatorOnce(
+  stub: DurableObjectStub,
+  request: CoordinatedRequest,
+): Promise<unknown> {
+  const response = await stub.fetch("https://coordinator.internal/request", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  });
+  if (!response.ok) {
+    let detail = "";
+    try {
+      detail = `: ${await response.text()}`.slice(0, 200);
+    } catch {
+      // The status alone remains authoritative when the body is unreadable.
+    }
+    throw new CoordinatorHttpError(response.status, detail);
+  }
+  return response.json();
+}
+
+function isRetryableCoordinatorFailure(
+  request: CoordinatedRequest,
+  error: UpstreamTransportError,
+): boolean {
+  if (request.method !== "GET" && request.method !== "HEAD") return false;
+  const cause: unknown = error.cause;
+  if (cause instanceof CoordinatorHttpError) {
+    return COORDINATOR_RETRYABLE_STATUSES.has(cause.status);
+  }
+  if (
+    typeof cause === "object" && cause !== null &&
+    (cause as { readonly overloaded?: unknown }).overloaded === true
+  ) {
+    return false;
+  }
+  return true;
 }
 
 export class RawHttp extends Context.Service<RawHttp, {
